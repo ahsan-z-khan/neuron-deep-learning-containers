@@ -1,0 +1,36 @@
+name: CodeBuild Test
+on: [push]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  OIDC-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Verify it works
+        run: |
+          echo "✅ OIDC authentication successful!"
+          echo "Repository: ${{ github.repository }}"
+          echo "Current AWS identity:"
+          aws sts get-caller-identity
+
+  Hello-World-Job:
+    needs: OIDC-test
+    runs-on:
+      - codebuild-github-test-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Test CodeBuild environment
+        run: |
+          echo "Hello World from CodeBuild!"
+          echo "Build ID: $CODEBUILD_BUILD_ID"
+          echo "Build ARN: $CODEBUILD_BUILD_ARN"

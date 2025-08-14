@@ -1,0 +1,173 @@
+name: Build Neuron Deep Learning Containers
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'docker/pytorch/**'
+      - 'docker/jax/**'
+      - 'docker/vllm/**'
+      - 'docker/common/**'
+      - '.github/workflows/build-neuron-dlc.yaml'
+  pull_request:
+    branches: [ main ]        
+    paths:
+      - 'docker/pytorch/**'
+      - 'docker/jax/**'
+      - 'docker/vllm/**'
+      - 'docker/common/**'
+  workflow_dispatch:    
+    inputs:
+      framework:
+        description: 'Framework to build (pytorch, jax, vllm, or all)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - pytorch
+          - jax
+          - vllm
+      versions:
+        description: 'Versions to build (comma-separated, e.g., "2.7.0,2.6.0")'
+        required: false
+        default: ''
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.changes.outputs.matrix }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed versions
+        id: changes
+        run: |
+          matrix_json="[]"
+          
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual trigger
+            framework="${{ github.event.inputs.framework }}"
+            versions="${{ github.event.inputs.versions }}"
+            
+            if [ "$framework" = "all" ] || [ "$framework" = "pytorch" ]; then
+              if [ -n "$versions" ]; then
+                IFS=',' read -ra VERSION_ARRAY <<< "$versions"
+                for version in "${VERSION_ARRAY[@]}"; do
+                  version=$(echo "$version" | xargs)
+                  for type in inference training; do
+                    path="docker/pytorch/$type/$version"
+                    if [ -f "$path/Dockerfile.neuronx" ]; then
+                      matrix_json=$(echo "$matrix_json" | jq ". + [{\"framework\": \"pytorch\", \"type\": \"$type\", \"version\": \"$version\", \"path\": \"$path\"}]")
+                    fi
+                  done
+                done
+              else
+                # Default PyTorch versions
+                for version in 2.7.0 2.6.0; do
+                  for type in inference training; do
+                    path="docker/pytorch/$type/$version"
+                    if [ -f "$path/Dockerfile.neuronx" ]; then
+                      matrix_json=$(echo "$matrix_json" | jq ". + [{\"framework\": \"pytorch\", \"type\": \"$type\", \"version\": \"$version\", \"path\": \"$path\"}]")
+                    fi
+                  done
+                done
+              fi
+            fi
+            
+            if [ "$framework" = "all" ] || [ "$framework" = "jax" ]; then
+              if [ -n "$versions" ]; then
+                IFS=',' read -ra VERSION_ARRAY <<< "$versions"
+                for version in "${VERSION_ARRAY[@]}"; do
+                  version=$(echo "$version" | xargs)
+                  path="docker/jax/training/$version"
+                  if [ -f "$path/Dockerfile.neuronx" ]; then
+                    matrix_json=$(echo "$matrix_json" | jq ". + [{\"framework\": \"jax\", \"type\": \"training\", \"version\": \"$version\", \"path\": \"$path\"}]")
+                  fi
+                done
+              else
+                # Default JAX versions
+                for version in 0.6 0.5; do
+                  path="docker/jax/training/$version"
+                  if [ -f "$path/Dockerfile.neuronx" ]; then
+                    matrix_json=$(echo "$matrix_json" | jq ". + [{\"framework\": \"jax\", \"type\": \"training\", \"version\": \"$version\", \"path\": \"$path\"}]")
+                  fi
+                done
+              fi
+            fi
+            
+            if [ "$framework" = "all" ] || [ "$framework" = "vllm" ]; then
+              if [ -n "$versions" ]; then
+                IFS=',' read -ra VERSION_ARRAY <<< "$versions"
+                for version in "${VERSION_ARRAY[@]}"; do
+                  version=$(echo "$version" | xargs)
+                  path="docker/vllm/inference/$version"
+                  if [ -f "$path/Dockerfile.neuronx" ]; then
+                    matrix_json=$(echo "$matrix_json" | jq ". + [{\"framework\": \"vllm\", \"type\": \"inference\", \"version\": \"$version\", \"path\": \"$path\"}]")
+                  fi
+                done
+              else
+                # Default vLLM versions
+                for version in 0.9.1 0.7.2; do
+                  path="docker/vllm/inference/$version"
+                  if [ -f "$path/Dockerfile.neuronx" ]; then
+                    matrix_json=$(echo "$matrix_json" | jq ". + [{\"framework\": \"vllm\", \"type\": \"inference\", \"version\": \"$version\", \"path\": \"$path\"}]")
+                  fi
+                done
+              fi
+            fi
+          else
+            # Detect changed Dockerfile paths
+            changed_paths=$(git diff --name-only origin/${{ github.base_ref }} ${{ github.sha }} \
+              | grep '^docker/.*/Dockerfile.neuronx$' \
+              | xargs -n1 dirname \
+              | sort -u)
+            
+            for path in $changed_paths; do
+              if [[ $path =~ ^docker/([^/]+)/([^/]+)/([^/]+)$ ]]; then
+                framework="${BASH_REMATCH[1]}"
+                type="${BASH_REMATCH[2]}"
+                version="${BASH_REMATCH[3]}"
+                matrix_json=$(echo "$matrix_json" | jq ". + [{\"framework\": \"$framework\", \"type\": \"$type\", \"version\": \"$version\", \"path\": \"$path\"}]")
+              fi
+            done
+          fi
+
+          matrix_compact=$(echo "$matrix_json" | jq -c .)
+          echo "Matrix JSON: $matrix_compact"
+          echo "matrix=$matrix_compact" >> $GITHUB_OUTPUT
+
+  build:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.matrix != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - name: Delete unnecessary tools folder to free runner space
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Copy common files next to Dockerfile
+        run: |
+          cp -r docker/common/* ${{ matrix.path }}/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.path }}
+          file: ${{ matrix.path }}/Dockerfile.neuronx
+          platforms: linux/amd64
+          tags: neuron-${{ matrix.framework }}-${{ matrix.type }}-dlc:${{ matrix.version }}-${{ github.sha }}
+          push: false
